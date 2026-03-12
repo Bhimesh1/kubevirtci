@@ -3,23 +3,57 @@ package nodes
 import (
 	_ "embed"
 	"fmt"
+	"os"
+	"regexp"
 	"runtime"
+
+	"github.com/Masterminds/semver/v3"
+	"github.com/sirupsen/logrus"
 
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/libssh"
 )
 
-//go:embed conf/00-cgroupv2.conf
-var cgroupv2 []byte
+const (
+	kubevirtProviderEnv = "KUBEVIRT_PROVIDER"
+)
+
+var (
+	//go:embed conf/00-cgroupv2.conf
+	cgroupv2 []byte
+
+	versionRegex = regexp.MustCompile(`.*([0-9]+\.[0-9]+)`)
+	v1_32        = semver.MustParse("v1.32")
+)
 
 type nodesProvisioner struct {
+	k8sVersion  string
 	sshClient   libssh.Client
 	singleStack bool
+	version     *semver.Version
 }
 
-func NewNodesProvisioner(sc libssh.Client, singleStack bool) *nodesProvisioner {
+func NewNodesProvisioner(k8sVersion string, sc libssh.Client, singleStack bool) *nodesProvisioner {
+	submatches := versionRegex.FindStringSubmatch(k8sVersion)
+	if len(submatches) != 2 {
+		logrus.Infof("not a parseable semver contained in %q. Trying the %q environment variable", k8sVersion, kubevirtProviderEnv)
+		kubevirtProvider, defined := os.LookupEnv(kubevirtProviderEnv)
+		if !defined {
+			logrus.Fatalf("not a parseable semver contained in %q and %q is not defined", k8sVersion, kubevirtProviderEnv)
+		}
+		submatches = versionRegex.FindStringSubmatch(kubevirtProvider)
+		if len(submatches) != 2 {
+			logrus.Fatalf("not a parseable semver contained in the %q environment variable", kubevirtProviderEnv)
+		}
+	}
+	version, err := semver.NewVersion("v" + submatches[1])
+	if err != nil {
+		logrus.Fatalf("not a parseable semver contained in %q", k8sVersion)
+	}
 	return &nodesProvisioner{
 		sshClient:   sc,
 		singleStack: singleStack,
+		k8sVersion:  k8sVersion,
+		version:     version,
 	}
 }
 
@@ -42,7 +76,7 @@ func (n *nodesProvisioner) Exec() error {
 	cmds := []string{
 		"source /var/lib/kubevirtci/shared_vars.sh",
 		`timeout=30; interval=5; while ! hostnamectl | grep Transient; do echo "Waiting for dhclient to set the hostname from dnsmasq"; sleep $interval; timeout=$((timeout - interval)); [ $timeout -le 0 ] && exit 1; done`,
-		`echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --fail-swap-on=false ` + nodeIP + ` --feature-gates=NodeSwap=true` + kubeletCpuManagerArgs + `" | tee /etc/sysconfig/kubelet > /dev/null`,
+		`echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --runtime-cgroups=/systemd/system.slice --kubelet-cgroups=/systemd/system.slice --fail-swap-on=false ` + nodeIP + " " + n.featureGatesFlag() + kubeletCpuManagerArgs + `" | tee /etc/sysconfig/kubelet > /dev/null`,
 		"systemctl daemon-reload &&  service kubelet restart",
 		"swapoff -a",
 		"until ip address show dev eth0 | grep global | grep inet6; do sleep 1; done",
@@ -59,4 +93,8 @@ func (n *nodesProvisioner) Exec() error {
 		}
 	}
 	return nil
+}
+
+func (n *nodesProvisioner) featureGatesFlag() string {
+	return "--feature-gates=NodeSwap=true"
 }

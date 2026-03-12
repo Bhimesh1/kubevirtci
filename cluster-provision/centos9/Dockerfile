@@ -1,4 +1,4 @@
-FROM quay.io/kubevirtci/fedora:41 AS base
+FROM registry.fedoraproject.org/fedora:43 AS base
 
 RUN dnf -y install jq iptables iproute dnsmasq qemu socat openssh-clients screen bind-utils tcpdump iputils libguestfs-tools-c && dnf clean all
 
@@ -15,16 +15,10 @@ RUN echo "Centos9 version $centos_version"
 
 COPY scripts/download_box.sh /
 
-RUN if test "$BUILDARCH" != "s390x"; then \
-      /download_box.sh https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-Vagrant-9-$centos_version.x86_64.vagrant-libvirt.box && \
-      curl -L -o /initramfs-amd64.img http://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/images/pxeboot/initrd.img && \
-      curl -L -o /vmlinuz-amd64 http://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/images/pxeboot/vmlinuz; \
-    else \
-      /download_box.sh https://cloud.centos.org/centos/9-stream/s390x/images/CentOS-Stream-GenericCloud-9-$centos_version.s390x.qcow2 && \
-      # Access virtual machine disk images directly by using LIBGUESTFS_BACKEND=direct, instead of libvirt
-      export LIBGUESTFS_BACKEND=direct && \
-      guestfish --ro --add box.qcow2 --mount /dev/sda1:/ ls /boot/ | grep -E '^vmlinuz-|^initramfs-' | xargs -I {} guestfish --ro --add box.qcow2 -i copy-out /boot/{} / ; \
-    fi
+RUN  /download_box.sh https://cloud.centos.org/centos/9-stream/$BUILDARCH/images/CentOS-Stream-GenericCloud-9-$centos_version.$BUILDARCH.qcow2 && \
+    # Access virtual machine disk images directly by using LIBGUESTFS_BACKEND=direct, instead of libvirt
+    export LIBGUESTFS_BACKEND=direct && \
+    guestfish --ro --add box.qcow2 --mount /dev/sda1:/ ls /boot/ | grep -E '^vmlinuz-|^initramfs-' | xargs -I {} guestfish --ro --add box.qcow2 -i copy-out /boot/{} / ; 
 
 
 FROM base AS nodecontainer

@@ -3,7 +3,6 @@ package node01
 import (
 	_ "embed"
 	"fmt"
-	"runtime"
 
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/libssh"
 )
@@ -17,13 +16,15 @@ var advAudit []byte
 type node01Provisioner struct {
 	sshClient   libssh.Client
 	singleStack bool
+	flannel     bool
 	etcdNoFsync bool
 }
 
-func NewNode01Provisioner(sc libssh.Client, singleStack, etcdNoFsync bool) *node01Provisioner {
+func NewNode01Provisioner(sc libssh.Client, singleStack, flannel, etcdNoFsync bool) *node01Provisioner {
 	return &node01Provisioner{
 		sshClient:   sc,
 		singleStack: singleStack,
+		flannel:     flannel,
 		etcdNoFsync: etcdNoFsync,
 	}
 }
@@ -34,9 +35,19 @@ func (n *node01Provisioner) Exec() error {
 		cniManifest = "/provision/cni.yaml"
 	)
 
+	if n.flannel {
+		kubeadmConf = "/etc/kubernetes/kubeadm_flannel.conf"
+		cniManifest = "/etc/kubernetes/flannel.yaml"
+	}
+
 	if n.singleStack {
-		kubeadmConf = "/etc/kubernetes/kubeadm_ipv6.conf"
-		cniManifest = "/provision/cni_ipv6.yaml"
+		if n.flannel {
+			kubeadmConf = "/etc/kubernetes/kubeadm_flannel_ipv6.conf"
+			cniManifest = "/etc/kubernetes/flannel_ipv6.yaml"
+		} else {
+			kubeadmConf = "/etc/kubernetes/kubeadm_ipv6.conf"
+			cniManifest = "/provision/cni_ipv6.yaml"
+		}
 	}
 
 	kubeadmInitCmd := "kubeadm init --config " + kubeadmConf + " -v5"
@@ -45,7 +56,7 @@ func (n *node01Provisioner) Exec() error {
 	}
 
 	cmds := []string{
-		`if [ -f /home/` + libssh.GetUserByArchitecture(runtime.GOARCH) + `/enable_audit ]; then echo '` + string(advAudit) + `' | tee /etc/kubernetes/audit/adv-audit.yaml > /dev/null; fi`,
+		`if [ -f /home/` + libssh.GetSSHUser() + `/enable_audit ]; then echo '` + string(advAudit) + `' | tee /etc/kubernetes/audit/adv-audit.yaml > /dev/null; fi`,
 		`timeout=30; interval=5; while ! hostnamectl | grep Transient; do echo "Waiting for dhclient to set the hostname from dnsmasq"; sleep $interval; timeout=$((timeout - interval)); [ $timeout -le 0 ] && exit 1; done`,
 		"swapoff -a",
 		"until ip address show dev eth0 | grep global | grep inet6; do sleep 1; done",
@@ -61,6 +72,14 @@ func (n *node01Provisioner) Exec() error {
 		"chcon -t container_file_t /var/lib/rook",
 	}
 	for _, cmd := range cmds {
+		err := n.sshClient.Command(cmd)
+		if err != nil {
+			return fmt.Errorf("error executing %s: %s", cmd, err)
+		}
+	}
+
+	if n.flannel {
+		cmd := `kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /etc/kubernetes/knp.yaml`
 		err := n.sshClient.Command(cmd)
 		if err != nil {
 			return fmt.Errorf("error executing %s: %s", cmd, err)

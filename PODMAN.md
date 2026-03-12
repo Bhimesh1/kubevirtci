@@ -15,7 +15,7 @@ instead of eth0.
 The current rules - [ssh](https://github.com/kubevirt/kubevirtci/blob/962d90cead28fc2aadcc07388b18d2479b2b6714/cluster-provision/centos8/scripts/vm.sh#L73), [restricted ports](https://github.com/kubevirt/kubevirtci/blob/962d90cead28fc2aadcc07388b18d2479b2b6714/cluster-provision/centos8/scripts/vm.sh#L83) - allow `make cluster-up` to run successfully, but
 unfortunately they break the cluster's network connectivity in a subtle way:
 image pulling fails because outgoing traffic to ports 22 6443 8443 80 443 30007
-30008 31001 is redirected to the VM in the respective node container (i.e.
+30008 31001 30085 is redirected to the VM in the respective node container (i.e.
 itself) instead of going to the specified host (e.g. quay.io).
 
 This will use `fuse-overlayfs` as storage layer. If the performance is not
@@ -57,3 +57,18 @@ and `KUBEVIRTCI_PODMAN_SOCKET` accordingly,
 i.e `export KUBEVIRTCI_PODMAN_SOCKET="${XDG_RUNTIME_DIR}/podman/podman.sock"`
 
 Tested on fedora 35.
+
+## Resource Adjustments
+
+When working with Podman, you might encounter PID resource constraints. To resolve this issue:
+
+1. Locate and edit your `containers.conf` file (typically in `/usr/share/containers`)
+2. Add or modify the PID limit setting:
+    ```toml
+    [containers]
+    # Configure the process ID (PID) limit for containers
+    # Options:
+    #   Numeric value: Sets specific PID limit (e.g., 2048)
+    #   -1: Removes PID limitations entirely
+    pids_limit = 2048
+    ```

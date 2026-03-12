@@ -9,6 +9,7 @@ type NodeLinuxConfig struct {
 	EtcdInMemory    bool
 	EtcdSize        string
 	SingleStack     bool
+	Flannel         bool
 	NoEtcdFsync     bool
 	EnableAudit     bool
 	GpuAddress      string
@@ -19,25 +20,27 @@ type NodeLinuxConfig struct {
 	KsmPageCount    int
 	KsmScanInterval int
 	Swappiness      int
-	UnlimitedSwap   bool
+	SwapBehavior    string
 	SwapSize        int
 }
 
 // NodeK8sConfig type holds the config k8s options for kubevirt cluster
 type NodeK8sConfig struct {
-	Ceph         bool
-	Prometheus   bool
-	Alertmanager bool
-	Grafana      bool
-	Istio        bool
-	NfsCsi       bool
-	CNAO         bool
-	CNAOSkipCR   bool
-	Multus       bool
-	CDI          bool
-	CDIVersion   string
-	AAQ          bool
-	AAQVersion   string
+	Ceph                     bool
+	Prometheus               bool
+	Alertmanager             bool
+	Grafana                  bool
+	Istio                    bool
+	NfsCsi                   bool
+	CNAO                     bool
+	CNAOSkipCR               bool
+	Multus                   bool
+	CDI                      bool
+	CDIVersion               string
+	AAQ                      bool
+	AAQVersion               string
+	DNC                      bool
+	NetworkResourcesInjector bool
 }
 
 func NewNodeK8sConfig(confs []K8sConfigFunc) *NodeK8sConfig {

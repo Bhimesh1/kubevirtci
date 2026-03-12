@@ -35,13 +35,15 @@ if [ ! -f "/tmp/extra-pre-pull-images" ]; then
     echo "ERROR: extra-pre-pull-images list missing"
     exit 1
 fi
-if [ ! -f "/tmp/fetch-images.sh" ]; then
-    echo "ERROR: fetch-images.sh missing"
+if [ ! -f "/tmp/pre-pull-images" ]; then
+    echo "ERROR: pre-pull-images missing"
     exit 1
 fi
 
 if grep -q "CentOS Stream 9" /etc/os-release; then
   release="centos9"
+elif grep -q "CentOS Stream 10" /etc/os-release; then
+  release="centos10"
 else
   echo "ERROR: Could not recognize guest OS"
   exit 1
@@ -64,12 +66,12 @@ function pull_container_retry() {
     fi
 }
 
-export CRIO_VERSION=1.32
+export CRIO_VERSION=1.33
 cat << EOF >/etc/yum.repos.d/devel_kubic_libcontainers_stable_cri-o_${CRIO_VERSION}.repo
-[isv_kubernetes_addons_cri-o_stable_v${CRIO_VERSION}]
+[isv_cri-o_stable_v${CRIO_VERSION}]
 name=CRI-O v${CRIO_VERSION} (Stable) (rpm)
 type=rpm-md
-baseurl=https://storage.googleapis.com/kubevirtci-crio-mirror/isv_kubernetes_addons_cri-o_stable_v${CRIO_VERSION}
+baseurl=https://storage.googleapis.com/kubevirtci-crio-mirror/isv_cri-o_stable_v${CRIO_VERSION}
 gpgcheck=0
 enabled=1
 EOF
@@ -122,13 +124,8 @@ fi
 kubeadm config images pull --kubernetes-version ${version}
 
 if [[ ${slim} == false ]]; then
-    # Pre pull all images from the manifests
-    for image in $(/tmp/fetch-images.sh /tmp); do
-        pull_container_retry "${image}"
-    done
-
-    # Pre pull additional images from list
-    for image in $(cat "/tmp/extra-pre-pull-images"); do
+    # Pre pull all images from the lists
+    for image in $(cat "/tmp/pre-pull-images" "/tmp/extra-pre-pull-images"); do
         pull_container_retry "${image}"
     done
 fi
@@ -139,11 +136,25 @@ cni_manifest="/provision/cni.yaml"
 cni_diff="/tmp/cni.diff"
 cni_manifest_ipv6="/provision/cni_ipv6.yaml"
 cni_ipv6_diff="/tmp/cni_ipv6.diff"
+flannel_manifest="/etc/kubernetes/flannel.yaml"
+flannel_diff="/tmp/flannel.diff"
+flannel_manifest_ipv6="/etc/kubernetes/flannel_ipv6.yaml"
+flannel_ipv6_diff="/tmp/flannel_ipv6.diff"
+knp_manifest="/etc/kubernetes/knp.yaml"
+knp_diff="/tmp/knp.diff"
 
 cp /tmp/cni.do-not-change.yaml $cni_manifest
 mv /tmp/cni.do-not-change.yaml $cni_manifest_ipv6
 patch $cni_manifest $cni_diff
 patch $cni_manifest_ipv6 $cni_ipv6_diff
+
+cp /tmp/flannel.do-not-change.yaml $flannel_manifest
+cp /tmp/flannel.do-not-change.yaml $flannel_manifest_ipv6
+patch $flannel_manifest $flannel_diff
+patch $flannel_manifest_ipv6 $flannel_ipv6_diff
+
+cp /tmp/knp.do-not-change.yaml $knp_manifest
+patch $knp_manifest $knp_diff
 
 cp /tmp/local-volume.yaml /provision/local-volume.yaml
 
@@ -214,14 +225,6 @@ echo "net.netfilter.nf_conntrack_max=1000000" >> /etc/sysctl.conf
 sysctl --system
 
 systemctl restart NetworkManager
-
-# No need to modify the ethernet connection incase of s390x Architecture.
-if [ "$arch" != "s390x" ]; then
-  nmcli connection modify "System eth0" \
-    ipv6.method auto \
-    ipv6.addr-gen-mode eui64
-  nmcli connection up "System eth0"
-fi
 
 kubeadmn_patches_path="/provision/kubeadm-patches"
 mkdir -p $kubeadmn_patches_path
@@ -310,26 +313,35 @@ EOF
 
 kubeadm_raw=/tmp/kubeadm.conf
 kubeadm_raw_ipv6=/tmp/kubeadm_ipv6.conf
+kubeadm_flannel_ipv6_raw=/tmp/kubeadm_flannel_ipv6.conf
 kubeadm_manifest="/etc/kubernetes/kubeadm.conf"
 kubeadm_manifest_ipv6="/etc/kubernetes/kubeadm_ipv6.conf"
+kubeadm_flannel_ipv6_manifest="/etc/kubernetes/kubeadm_flannel_ipv6.conf"
+
+kubeadm_flannel_raw="/tmp/kubeadm_flannel.conf"
+kubeadm_flannel="/etc/kubernetes/kubeadm_flannel.conf"
 
 envsubst < $kubeadm_raw > $kubeadm_manifest
 envsubst < $kubeadm_raw_ipv6 > $kubeadm_manifest_ipv6
 
+envsubst < $kubeadm_flannel_raw > $kubeadm_flannel
+envsubst < $kubeadm_flannel_ipv6_raw > $kubeadm_flannel_ipv6_manifest
+
 until ip address show dev eth0 | grep global | grep inet6; do sleep 1; done
 
-if ! kubeadm init --config $kubeadm_manifest -v5; then
+if ! kubeadm init --config $kubeadm_flannel -v5; then
     kubeadm reset --force
     rm -rf /etc/cni/net.d/* /var/lib/cni /var/lib/kubelet
-    kubeadm init --config $kubeadm_manifest -v5
+    kubeadm init --config $kubeadm_flannel -v5
 fi
 
 kubectl --kubeconfig=/etc/kubernetes/admin.conf patch deployment coredns -n kube-system -p "$(cat $kubeadmn_patches_path/add-security-context-deployment-patch.yaml)"
-kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f "$cni_manifest"
+kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f "$flannel_manifest"
+kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f "$knp_manifest"
 
 # Wait at least for 7 pods
-while [[ "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system --no-headers | wc -l)" -lt 7 ]]; do
-    echo "Waiting for at least 7 pods to appear ..."
+while [[ "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system --no-headers | wc -l)" -lt 8 ]]; do
+    echo "Waiting for at least 8 pods to appear ..."
     kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
     sleep 10
 done
@@ -342,15 +354,16 @@ while [ -n "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-s
 done
 
 # Make sure all containers are ready
-while [ -n "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | grep false)" ]; do
+while [ -n "$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers | grep false)" ]; do
     echo "Waiting for all containers to become ready ..."
-    kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A -o'custom-columns=status:status.containerStatuses[*].ready,metadata:metadata.name' --no-headers
     sleep 10
 done
 
-kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
 
 kubeadm reset --force
+rm -rf /etc/cni/net.d/* /var/lib/cni /var/lib/kubelet
 
 # Create local-volume directories
 for i in {1..10}

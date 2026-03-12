@@ -6,13 +6,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alessio/shellescape"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -24,8 +24,8 @@ import (
 	containers2 "kubevirt.io/kubevirtci/cluster-provision/gocli/containers"
 
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/cmd/utils"
-	"kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/libssh"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/docker"
+	"kubevirt.io/kubevirtci/cluster-provision/gocli/pkg/libssh"
 )
 
 // NewProvisionCommand provision given cluster
@@ -53,14 +53,18 @@ func NewProvisionCommand() *cobra.Command {
 
 func provisionCluster(cmd *cobra.Command, args []string) (retErr error) {
 	var base string
-	sshUser := libssh.GetUserByArchitecture(runtime.GOARCH)
+	sshUser := libssh.GetSSHUser()
 	packagePath := args[0]
+	centosVersion := os.Getenv("PROVISION_CENTOS_VERSION")
+	if centosVersion == "" {
+		// default to Centos Stream 9
+		centosVersion = "9"
+	}
 	versionBytes, err := os.ReadFile(filepath.Join(packagePath, "version"))
 	if err != nil {
 		return err
 	}
 	version := strings.TrimSpace(string(versionBytes))
-	baseBytes, err := os.ReadFile(filepath.Join(packagePath, "base"))
 	if err != nil {
 		return err
 	}
@@ -70,10 +74,15 @@ func provisionCluster(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	if strings.Contains(phases, "linux") {
-		base = fmt.Sprintf("quay.io/kubevirtci/%s", strings.TrimSpace(string(baseBytes)))
+		base = fmt.Sprintf("quay.io/kubevirtci/centos%s", centosVersion)
 	} else {
 		k8sPath := fmt.Sprintf("%s/../", packagePath)
-		baseImageBytes, err := os.ReadFile(filepath.Join(k8sPath, "base-image"))
+		// Select base-image file based on PROVISION_CENTOS_VERSION
+		baseImageFile := "base-image"
+		if centosVersion == "10" {
+			baseImageFile = "base-image-centos10"
+		}
+		baseImageBytes, err := os.ReadFile(filepath.Join(k8sPath, baseImageFile))
 		if err != nil {
 			return err
 		}
@@ -148,7 +157,7 @@ func provisionCluster(cmd *cobra.Command, args []string) (retErr error) {
 	}()
 
 	// Pull the base image
-	err = docker.ImagePull(cli, ctx, base, types.ImagePullOptions{})
+	err = docker.ImagePull(cli, ctx, base, image.PullOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -259,7 +268,7 @@ func provisionCluster(cmd *cobra.Command, args []string) (retErr error) {
 		if err != nil {
 			return err
 		}
-		err = _cmd(cli, nodeContainer(prefix, nodeName), fmt.Sprintf("if [ -f /scripts/fetch-images.sh ]; then scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i vagrant.key -P 22 /scripts/fetch-images.sh %s@192.168.66.101:/tmp/fetch-images.sh; fi", sshUser), "copying /scripts/fetch-images.sh if existing")
+		err = _cmd(cli, nodeContainer(prefix, nodeName), fmt.Sprintf("if [ -f /scripts/pre-pull-images ]; then scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i vagrant.key -P 22 /scripts/pre-pull-images %s@192.168.66.101:/tmp/pre-pull-images; fi", sshUser), "copying /scripts/pre-pull-images if existing")
 		if err != nil {
 			return err
 		}
@@ -280,23 +289,35 @@ func provisionCluster(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
-	_cmd(cli, nodeContainer(prefix, nodeName), "ssh.sh sudo shutdown now -h", "shutting down the node")
-	err = _cmd(cli, nodeContainer(prefix, nodeName), "rm /usr/local/bin/ssh.sh", "removing the ssh.sh script")
-	if err != nil {
-		return err
-	}
 	err = _cmd(cli, nodeContainer(prefix, nodeName), "rm /ssh_ready", "removing the ssh_ready mark")
 	if err != nil {
 		return err
 	}
+
+	err = _cmd(cli, nodeContainer(prefix, nodeName), "ssh.sh sudo systemd-run --on-active=10s --unit=delayed-shutdown shutdown -h now", "shutting down the node")
+	if err != nil {
+		return err
+	}
+
+	err = _cmd(cli, nodeContainer(prefix, nodeName), "rm /usr/local/bin/ssh.sh", "removing the ssh.sh script")
+	if err != nil {
+		return err
+	}
+
 	logrus.Info("waiting for the node to stop")
-	okChan, errChan := cli.ContainerWait(ctx, nodeContainer(prefix, nodeName), container.WaitConditionNotRunning)
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	okChan, errChan := cli.ContainerWait(waitCtx, nodeContainer(prefix, nodeName), container.WaitConditionNotRunning)
 	select {
 	case <-okChan:
+		logrus.Info("node stopped successfully")
 	case err := <-errChan:
 		if err != nil {
-			return fmt.Errorf("waiting for the node to stop failed: %v", err)
+			return fmt.Errorf("error: waiting for the node to stop failed: %v", err)
 		}
+	case <-waitCtx.Done():
+		return fmt.Errorf("error: timeout waiting for node to stop")
 	}
 
 	logrus.Info("preparing additional persistent kernel arguments after initial provision")
@@ -353,7 +374,7 @@ func copyDirectory(ctx context.Context, cli *client.Client, containerID string, 
 	}
 	defer preparedArchive.Close()
 
-	err = cli.CopyToContainer(ctx, containerID, dstDir, preparedArchive, types.CopyToContainerOptions{AllowOverwriteDirWithFile: false})
+	err = cli.CopyToContainer(ctx, containerID, dstDir, preparedArchive, container.CopyToContainerOptions{AllowOverwriteDirWithFile: false})
 	if err != nil {
 		return err
 	}

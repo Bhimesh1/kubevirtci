@@ -6,3 +6,6 @@ util-linux
 iputils
 openssh
 curl
+eudev
+udev-init-scripts
+pciutils

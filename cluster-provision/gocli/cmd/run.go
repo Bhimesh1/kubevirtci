@@ -15,8 +15,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -40,6 +40,7 @@ import (
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/istio"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/ksm"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/multus"
+	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/network_resources_injector"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/nfscsi"
 	"kubevirt.io/kubevirtci/cluster-provision/gocli/opts/node01"
 	nodesprovision "kubevirt.io/kubevirtci/cluster-provision/gocli/opts/nodes"
@@ -80,8 +81,8 @@ EOF
 	etcdDataDir         = "/var/lib/etcd"
 	nvmeDiskImagePrefix = "/nvme"
 	scsiDiskImagePrefix = "/scsi"
-	QEMU_DEVICE_S390X  = "virtio-net-ccw"
-	QEMU_DEVICE_X86_64 = "virtio-net-pci"
+	QEMU_DEVICE_S390X   = "virtio-net-ccw"
+	QEMU_DEVICE_X86_64  = "virtio-net-pci"
 )
 
 var soundcardPCIIDs = []string{"8086:2668", "8086:2415"}
@@ -131,6 +132,7 @@ func NewRunCommand() *cobra.Command {
 	run.Flags().Bool("reverse", false, "reverse node setup order")
 	run.Flags().Bool("enable-cnao", false, "enable network extensions with istio")
 	run.Flags().Bool("skip-cnao-cr", false, "skip deploying cnao custom resource. if true, only cnao CRDS will be deployed")
+	run.Flags().Bool("deploy-dnc", false, "deploy the dynamic networks controller with CNAO")
 	run.Flags().Bool("deploy-multus", false, "deploy multus")
 	run.Flags().Bool("deploy-cdi", false, "deploy cdi")
 	run.Flags().String("cdi-version", "", "cdi version")
@@ -144,7 +146,7 @@ func NewRunCommand() *cobra.Command {
 	run.Flags().Uint("ksm-page-count", 10, "number of pages to scan per time in ksm")
 	run.Flags().Uint("ksm-scan-interval", 20, "sleep interval in milliseconds for ksm")
 	run.Flags().Bool("enable-swap", false, "enable swap")
-	run.Flags().Bool("unlimited-swap", false, "unlimited swap")
+	run.Flags().String("swap-behavior", "", "kubelet swap behavior")
 	run.Flags().Uint("swap-size", 0, "swap memory size in GB")
 	run.Flags().Uint("swapiness", 0, "swapiness")
 	run.Flags().String("docker-proxy", "", "sets network proxy for docker daemon")
@@ -162,10 +164,12 @@ func NewRunCommand() *cobra.Command {
 	run.Flags().Bool("enable-fips", false, "enables FIPS")
 	run.Flags().Bool("enable-psa", false, "Pod Security Admission")
 	run.Flags().Bool("single-stack", false, "enable single stack IPv6")
+	run.Flags().Bool("flannel", false, "use flannel CNI instead of default CNI")
 	run.Flags().Bool("no-etcd-fsync", false, "unsafe: disable fsyncs in etcd")
 	run.Flags().Bool("enable-audit", false, "enable k8s audit for all metadata events")
 	run.Flags().StringArrayVar(&usbDisks, "usb", []string{}, "size of the emulate USB disk to pass to the node")
 	run.Flags().StringArrayVar(&sharedDisks, "shared-block-device", []string{}, "size of block device to share between all nodes")
+	run.Flags().Bool("deploy-network-resources-injector", false, "deploys Network Resources Injector")
 
 	return run
 }
@@ -338,6 +342,10 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	flannel, err := cmd.Flags().GetBool("flannel")
+	if err != nil {
+		return err
+	}
 	noEtcdFsync, err := cmd.Flags().GetBool("no-etcd-fsync")
 	if err != nil {
 		return err
@@ -355,6 +363,10 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 	cnaoSkipCR, err := cmd.Flags().GetBool("skip-cnao-cr")
+	if err != nil {
+		return err
+	}
+	deployDNC, err := cmd.Flags().GetBool("deploy-dnc")
 	if err != nil {
 		return err
 	}
@@ -389,7 +401,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 
-	unlimitedSwap, err := cmd.Flags().GetBool("unlimited-swap")
+	swapBehavior, err := cmd.Flags().GetString("swap-behavior")
 	if err != nil {
 		return err
 	}
@@ -415,6 +427,11 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	ksmScanInterval, err := cmd.Flags().GetUint("ksm-scan-interval")
+	if err != nil {
+		return err
+	}
+
+	deployNetworkResourcesInjector, err := cmd.Flags().GetBool("deploy-network-resources-injector")
 	if err != nil {
 		return err
 	}
@@ -463,7 +480,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	if len(containerRegistry) > 0 {
 		clusterImage = path.Join(containerRegistry, clusterImage)
 		fmt.Printf("Download the image %s\n", clusterImage)
-		err = docker.ImagePull(cli, ctx, clusterImage, types.ImagePullOptions{})
+		err = docker.ImagePull(cli, ctx, clusterImage, image.PullOptions{})
 		if err != nil {
 			panic(fmt.Sprintf("Failed to download cluster image %s, %s", clusterImage, err))
 		}
@@ -510,7 +527,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	apiServerPort, err := utils.GetPublicPort(utils.PortAPI, dm.NetworkSettings.Ports)
 
 	// Pull the registry image
-	err = docker.ImagePull(cli, ctx, utils.DockerRegistryImage, types.ImagePullOptions{})
+	err = docker.ImagePull(cli, ctx, utils.DockerRegistryImage, image.PullOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -536,7 +553,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			return err
 		}
 		// Pull the ganesha image
-		err = docker.ImagePull(cli, ctx, utils.NFSGaneshaImage, types.ImagePullOptions{})
+		err = docker.ImagePull(cli, ctx, utils.NFSGaneshaImage, image.PullOptions{})
 		if err != nil {
 			panic(err)
 		}
@@ -578,7 +595,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 	qemuArgs += " -serial pty"
 
 	var qemuNetDevice = getNetDeviceByArch()
-	
+
 	wg := sync.WaitGroup{}
 	wg.Add(int(nodes))
 	// start one vm after each other
@@ -592,8 +609,8 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			netSuffix := fmt.Sprintf("%d-%d", x, i)
 			macSuffix := fmt.Sprintf("%02x", macCounter)
 			macCounter++
-			// Secondary network devices are added after VM is started (hot-plug) using qemu monitor to avoid 
-			// primary network interface to be named other than eth0. This is mainly required for s390x, as 
+			// Secondary network devices are added after VM is started (hot-plug) using qemu monitor to avoid
+			// primary network interface to be named other than eth0. This is mainly required for s390x, as
 			// otherwise if primary interface is other than eth0, it can't get the IP from dhcp server.
 			if qemuNetDevice == QEMU_DEVICE_S390X {
 				nodeQemuMonitorArgs = fmt.Sprintf("%s netdev_add tap,id=secondarynet%s,ifname=stap%s,script=no,downscript=no; device_add %s,netdev=secondarynet%s,mac=52:55:00:d1:56:%s;", nodeQemuMonitorArgs, netSuffix, netSuffix, qemuNetDevice, netSuffix, macSuffix)
@@ -803,6 +820,7 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			nodesconfig.WithEtcdInMemory(runEtcdOnMemory),
 			nodesconfig.WithEtcdSize(etcdDataMountSize),
 			nodesconfig.WithSingleStack(singleStack),
+			nodesconfig.WithFlannel(flannel),
 			nodesconfig.WithNoEtcdFsync(noEtcdFsync),
 			nodesconfig.WithEnableAudit(enableAudit),
 			nodesconfig.WithGpuAddress(gpuAddress),
@@ -813,8 +831,8 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 			nodesconfig.WithKsmScanInterval(int(ksmScanInterval)),
 			nodesconfig.WithSwap(enableSwap),
 			nodesconfig.WithSwapiness(int(swapiness)),
+			nodesconfig.WithSwapBehavior(swapBehavior),
 			nodesconfig.WithSwapSize(int(swapSize)),
-			nodesconfig.WithUnlimitedSwap(unlimitedSwap),
 		}
 
 		n := nodesconfig.NewNodeLinuxConfig(x+1, prefix, linuxConfigFuncs)
@@ -843,11 +861,13 @@ func run(cmd *cobra.Command, args []string) (retErr error) {
 		nodesconfig.WithNfsCsi(nfsCsiEnabled),
 		nodesconfig.WithCnao(cnaoEnabled),
 		nodesconfig.WithCNAOSkipCR(cnaoSkipCR),
+		nodesconfig.WithDNC(deployDNC),
 		nodesconfig.WithMultus(deployMultus),
 		nodesconfig.WithCdi(deployCdi),
 		nodesconfig.WithCdiVersion(cdiVersion),
 		nodesconfig.WithAAQ(deployAaq),
 		nodesconfig.WithAAQVersion(aaqVersion),
+		nodesconfig.WithNetworkResourcesInjector(deployNetworkResourcesInjector),
 	}
 	n := nodesconfig.NewNodeK8sConfig(k8sConfs)
 
@@ -903,7 +923,7 @@ func provisionK8sOptions(sshClient libssh.Client, k8sClient k8s.K8sDynamicClient
 	}
 
 	if n.CNAO {
-		cnaoOpt := cnao.NewCnaoOpt(k8sClient, sshClient, n.Multus, n.CNAOSkipCR)
+		cnaoOpt := cnao.NewCnaoOpt(k8sClient, sshClient, n.Multus, n.DNC, n.CNAOSkipCR)
 		opts = append(opts, cnaoOpt)
 	}
 
@@ -929,6 +949,11 @@ func provisionK8sOptions(sshClient libssh.Client, k8sClient k8s.K8sDynamicClient
 		} else {
 			logrus.Info("AAQ was requested but k8s version is not k8s-1.30, skipping")
 		}
+	}
+
+	if n.NetworkResourcesInjector {
+		networkResourcesInjectorOpt := network_resources_injector.NewNetworkResourcesInjectorOpt(sshClient, k8sClient)
+		opts = append(opts, networkResourcesInjectorOpt)
 	}
 
 	for _, opt := range opts {
@@ -983,7 +1008,7 @@ func provisionNode(sshClient libssh.Client, n *nodesconfig.NodeLinuxConfig) erro
 	}
 
 	if n.EnableAudit {
-		if err := sshClient.Command(fmt.Sprintf("touch /home/%s/enable_audit", libssh.GetUserByArchitecture(runtime.GOARCH))); err != nil {
+		if err := sshClient.Command(fmt.Sprintf("touch /home/%s/enable_audit", libssh.GetSSHUser())); err != nil {
 			return fmt.Errorf("provisioning node %d failed (setting enableAudit phase): %s", n.NodeIdx, err)
 		}
 	}
@@ -994,7 +1019,7 @@ func provisionNode(sshClient libssh.Client, n *nodesconfig.NodeLinuxConfig) erro
 	}
 
 	if n.NodeIdx == 1 {
-		n := node01.NewNode01Provisioner(sshClient, n.SingleStack, n.NoEtcdFsync)
+		n := node01.NewNode01Provisioner(sshClient, n.SingleStack, n.Flannel, n.NoEtcdFsync)
 		opts = append(opts, n)
 
 	} else {
@@ -1007,7 +1032,7 @@ func provisionNode(sshClient libssh.Client, n *nodesconfig.NodeLinuxConfig) erro
 			bindVfioOpt := bindvfio.NewBindVfioOpt(sshClient, gpuDeviceID)
 			opts = append(opts, bindVfioOpt)
 		}
-		n := nodesprovision.NewNodesProvisioner(sshClient, n.SingleStack)
+		n := nodesprovision.NewNodesProvisioner(n.K8sVersion, sshClient, n.SingleStack)
 		opts = append(opts, n)
 	}
 
@@ -1017,7 +1042,7 @@ func provisionNode(sshClient libssh.Client, n *nodesconfig.NodeLinuxConfig) erro
 	}
 
 	if n.SwapEnabled {
-		swapOpt := swap.NewSwapOpt(sshClient, n.Swappiness, n.UnlimitedSwap, n.SwapSize)
+		swapOpt := swap.NewSwapOpt(sshClient, n.Swappiness, n.SwapBehavior, n.SwapSize)
 		opts = append(opts, swapOpt)
 	}
 

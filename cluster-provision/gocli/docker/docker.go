@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
@@ -58,14 +60,14 @@ func GetPrefixedVolumes(cli *client.Client, prefix string) ([]*volume.Volume, er
 	return volumes.Volumes, nil
 }
 
-func ImagePull(cli *client.Client, ctx context.Context, ref string, options types.ImagePullOptions) error {
+func ImagePull(cli *client.Client, ctx context.Context, ref string, options image.PullOptions) error {
 
 	if !strings.ContainsAny(ref, ":@") {
 		ref = ref + ":latest"
 	}
 	ref = strings.TrimPrefix(ref, "docker.io/")
 
-	images, err := cli.ImageList(ctx, types.ImageListOptions{All: true})
+	images, err := cli.ImageList(ctx, image.ListOptions{All: true})
 	if err != nil {
 		return err
 	}
@@ -97,9 +99,9 @@ func ImagePull(cli *client.Client, ctx context.Context, ref string, options type
 	return fmt.Errorf("failed to download %s four times, giving up.", ref)
 }
 
-func Exec(cli *client.Client, container string, args []string, out io.Writer) (bool, error) {
+func Exec(cli *client.Client, containerID string, args []string, out io.Writer) (bool, error) {
 	ctx := context.Background()
-	id, err := cli.ContainerExecCreate(ctx, container, types.ExecConfig{
+	id, err := cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
 		Privileged:   true,
 		Tty:          true,
 		Detach:       false,
@@ -112,7 +114,7 @@ func Exec(cli *client.Client, container string, args []string, out io.Writer) (b
 		return false, err
 	}
 
-	attached, err := cli.ContainerExecAttach(ctx, id.ID, types.ExecStartCheck{
+	attached, err := cli.ContainerExecAttach(ctx, id.ID, container.ExecStartOptions{
 		Detach: false,
 		Tty:    true,
 	})
@@ -130,16 +132,16 @@ func Exec(cli *client.Client, container string, args []string, out io.Writer) (b
 	return resp.ExitCode == 0, nil
 }
 
-func Terminal(cli *client.Client, container string, args []string, file *os.File) (int, error) {
+func Terminal(cli *client.Client, containerID string, args []string, file *os.File) (int, error) {
 
 	if !terminal.IsTerminal(int(file.Fd())) {
 		return 1, fmt.Errorf("failure calling terminal out of TTY")
 	}
 
 	ctx := context.Background()
-	id, err := cli.ContainerExecCreate(ctx, container, types.ExecConfig{
+	id, err := cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
 		Privileged:   true,
-		Tty:          terminal.IsTerminal(int(file.Fd())),
+		Tty:          true,
 		Detach:       false,
 		Cmd:          args,
 		AttachStdout: true,
@@ -151,9 +153,9 @@ func Terminal(cli *client.Client, container string, args []string, file *os.File
 		return -1, err
 	}
 
-	attached, err := cli.ContainerExecAttach(ctx, id.ID, types.ExecStartCheck{
+	attached, err := cli.ContainerExecAttach(ctx, id.ID, container.ExecStartOptions{
 		Detach: false,
-		Tty:    terminal.IsTerminal(int(file.Fd())),
+		Tty:    true,
 	})
 	if err != nil {
 		return -1, err
@@ -164,6 +166,16 @@ func Terminal(cli *client.Client, container string, args []string, file *os.File
 	if err != nil {
 		return -1, err
 	}
+
+	resizeCh := make(chan os.Signal, 1)
+	signal.Notify(resizeCh, syscall.SIGWINCH)
+	resizeTerminal(ctx, cli, id.ID, file)
+	go func() {
+		for range resizeCh {
+			resizeTerminal(ctx, cli, id.ID, file)
+		}
+	}()
+	defer signal.Stop(resizeCh)
 
 	errChan := make(chan error)
 
@@ -354,4 +366,13 @@ type PullStatus struct {
 	ProgressDetail PullProgressDetail `json:"progressDetail,omitempty"`
 	Progress       string             `json:"progress,omitempty"`
 	Error          string             `json:"error,omitempty"`
+}
+
+func resizeTerminal(ctx context.Context, cli *client.Client, execID string, file *os.File) {
+	if w, h, err := terminal.GetSize(int(file.Fd())); err == nil {
+		cli.ContainerExecResize(ctx, execID, container.ResizeOptions{
+			Height: uint(h),
+			Width:  uint(w),
+		})
+	}
 }
